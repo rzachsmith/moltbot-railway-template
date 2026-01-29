@@ -719,7 +719,12 @@ app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
     const result = childProcess.spawnSync("moltbot", ["doctor", "--fix"], {
       encoding: "utf8",
       timeout: 30000,
-      env: { ...process.env, HOME: "/root" },
+      env: {
+        ...process.env,
+        HOME: "/root",
+        MOLTBOT_STATE_DIR: STATE_DIR,
+        CLAWDBOT_STATE_DIR: STATE_DIR,
+      },
     });
     const output = (result.stdout || "") + (result.stderr || "");
     if (result.status === 0) {

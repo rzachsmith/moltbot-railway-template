@@ -713,6 +713,25 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   }
 });
 
+app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
+  // Run moltbot doctor --fix to clean up invalid config keys
+  try {
+    const result = spawnSync("moltbot", ["doctor", "--fix"], {
+      encoding: "utf8",
+      timeout: 30000,
+      env: { ...process.env, HOME: "/root" },
+    });
+    const output = (result.stdout || "") + (result.stderr || "");
+    if (result.status === 0) {
+      res.type("text/plain").send("Doctor completed successfully:\n" + output);
+    } else {
+      res.type("text/plain").send("Doctor exited with code " + result.status + ":\n" + output);
+    }
+  } catch (err) {
+    res.status(500).type("text/plain").send("Doctor failed: " + String(err));
+  }
+});
+
 app.get("/setup/export", requireSetupAuth, async (_req, res) => {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });

@@ -713,6 +713,40 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   }
 });
 
+app.post("/setup/api/fix-config", requireSetupAuth, async (_req, res) => {
+  // Manually fix known config issues that doctor can't handle
+  try {
+    const configFile = configPath();
+    if (!fs.existsSync(configFile)) {
+      return res.status(404).type("text/plain").send("Config file not found");
+    }
+
+    const config = JSON.parse(fs.readFileSync(configFile, "utf8"));
+    let changes = [];
+
+    // Remove invalid tts config
+    if (config.messages?.tts) {
+      delete config.messages.tts;
+      changes.push("Removed messages.tts (invalid provider)");
+    }
+
+    // Remove trustedProxies if present
+    if (config.gateway?.trustedProxies) {
+      delete config.gateway.trustedProxies;
+      changes.push("Removed gateway.trustedProxies");
+    }
+
+    if (changes.length === 0) {
+      return res.type("text/plain").send("No fixes needed - config looks clean");
+    }
+
+    fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
+    res.type("text/plain").send("Config fixed:\n- " + changes.join("\n- "));
+  } catch (err) {
+    res.status(500).type("text/plain").send("Fix failed: " + String(err));
+  }
+});
+
 app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
   // Run moltbot doctor --fix to clean up invalid config keys
   try {

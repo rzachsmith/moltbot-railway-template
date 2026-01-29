@@ -224,6 +224,17 @@ function requireSetupAuth(req, res, next) {
 
 const app = express();
 app.disable("x-powered-by");
+
+// Security: Force HTTPS in production (Railway terminates TLS and sets x-forwarded-proto)
+app.use((req, res, next) => {
+  const proto = req.get("x-forwarded-proto");
+  if (proto && proto !== "https") {
+    const host = req.get("host") || "";
+    return res.redirect(301, `https://${host}${req.originalUrl}`);
+  }
+  next();
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 // Configure multer for file uploads (used by /setup/import)
@@ -1012,6 +1023,58 @@ proxy.on("error", (err, _req, _res) => {
   console.error("[proxy]", err);
 });
 
+// Routes that must remain public (webhooks from external services)
+const PUBLIC_ROUTE_PREFIXES = [
+  "/telegram",    // Telegram webhook
+  "/discord",     // Discord webhook
+  "/slack",       // Slack webhook
+  "/webhook",     // Generic webhook
+  "/healthz",     // Health checks
+];
+
+function isPublicRoute(path) {
+  return PUBLIC_ROUTE_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
+
+// Security: Control UI routes require Basic Auth (same as /setup)
+// This adds a layer of protection before the gateway token check
+function requireControlUiAuth(req, res, next) {
+  // Skip auth for public webhook routes
+  if (isPublicRoute(req.path)) {
+    return next();
+  }
+
+  // Only protect Control UI routes
+  if (!req.path.startsWith("/clawdbot")) {
+    return next();
+  }
+
+  // Require SETUP_PASSWORD for Control UI access
+  if (!SETUP_PASSWORD) {
+    return res
+      .status(500)
+      .type("text/plain")
+      .send("SETUP_PASSWORD is not set. Set it in Railway Variables.");
+  }
+
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme !== "Basic" || !encoded) {
+    res.set("WWW-Authenticate", 'Basic realm="Moltbot Control UI"');
+    return res.status(401).send("Auth required");
+  }
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  if (password !== SETUP_PASSWORD) {
+    res.set("WWW-Authenticate", 'Basic realm="Moltbot Control UI"');
+    return res.status(401).send("Invalid password");
+  }
+  return next();
+}
+
+app.use(requireControlUiAuth);
+
 app.use(async (req, res) => {
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
@@ -1046,6 +1109,32 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+
+  // Security: Require Basic Auth for Control UI WebSocket connections
+  // (The gateway token is a second layer of auth, but this ensures only
+  // users with SETUP_PASSWORD can even attempt to connect)
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const isControlUi = url.pathname.startsWith("/clawdbot");
+
+  if (isControlUi && SETUP_PASSWORD) {
+    const header = req.headers.authorization || "";
+    const [scheme, encoded] = header.split(" ");
+    let authenticated = false;
+    if (scheme === "Basic" && encoded) {
+      const decoded = Buffer.from(encoded, "base64").toString("utf8");
+      const idx = decoded.indexOf(":");
+      const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+      authenticated = password === SETUP_PASSWORD;
+    }
+    if (!authenticated) {
+      // WebSocket upgrade: can't send proper 401 with WWW-Authenticate,
+      // so just close the socket
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+  }
+
   try {
     await ensureGatewayRunning();
   } catch {

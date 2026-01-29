@@ -65,6 +65,10 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /moltbot/dist/index.js "$@"' 
 # Backwards compatibility: clawdbot shim points to moltbot
 RUN ln -s /usr/local/bin/moltbot /usr/local/bin/clawdbot
 
+# Install bird CLI for Twitter/X reading (credentials come from env vars at runtime)
+RUN npm install -g @steipete/bird@latest \
+  && bird --version
+
 COPY src ./src
 
 # The wrapper listens on this port.

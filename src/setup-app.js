@@ -6,6 +6,7 @@
   var authGroupEl = document.getElementById('authGroup');
   var authChoiceEl = document.getElementById('authChoice');
   var logEl = document.getElementById('log');
+  var importStatusEl = document.getElementById('importStatus');
 
   function setStatus(s) {
     statusEl.textContent = s;
@@ -56,12 +57,12 @@
   function refreshStatus() {
     setStatus('Loading...');
     return httpJson('/setup/api/status').then(function (j) {
-      var ver = j.clawdbotVersion ? (' | ' + j.clawdbotVersion) : '';
+      var ver = j.moltbotVersion ? (' | ' + j.moltbotVersion) : '';
       setStatus((j.configured ? 'Configured - open /clawdbot' : 'Not configured - run setup below') + ver);
       renderAuth(j.authGroups || []);
       // If channels are unsupported, surface it for debugging.
       if (j.channelsAddHelp && j.channelsAddHelp.indexOf('telegram') === -1) {
-        logEl.textContent += '\nNote: this clawdbot build does not list telegram in `channels add --help`. Telegram auto-add will be skipped.\n';
+        logEl.textContent += '\nNote: this moltbot build does not list telegram in `channels add --help`. Telegram auto-add will be skipped.\n';
       }
 
     }).catch(function (e) {
@@ -132,6 +133,57 @@
       .then(function (t) { logEl.textContent += t + '\n'; return refreshStatus(); })
       .catch(function (e) { logEl.textContent += 'Error: ' + String(e) + '\n'; });
   };
+
+  // Import backup handler
+  var importBtn = document.getElementById('importBtn');
+  var importFileEl = document.getElementById('importFile');
+  if (importBtn && importFileEl && importStatusEl) {
+    importBtn.onclick = function () {
+      var file = importFileEl.files[0];
+      if (!file) {
+        importStatusEl.textContent = 'Please select a .tar.gz backup file first.';
+        return;
+      }
+
+      if (!file.name.endsWith('.tar.gz') && !file.name.endsWith('.tgz')) {
+        importStatusEl.textContent = 'Error: File must be a .tar.gz or .tgz archive.';
+        return;
+      }
+
+      if (!confirm('Import backup? This will replace your current config and workspace with the backup contents.')) {
+        return;
+      }
+
+      importStatusEl.textContent = 'Uploading and importing... (this may take a moment)';
+      importBtn.disabled = true;
+
+      var formData = new FormData();
+      formData.append('backup', file);
+
+      fetch('/setup/import', {
+        method: 'POST',
+        credentials: 'same-origin',
+        body: formData
+      }).then(function (res) {
+        return res.json();
+      }).then(function (j) {
+        if (j.ok) {
+          importStatusEl.innerHTML = '<strong style="color:green">Import successful!</strong> ' + (j.message || '');
+          if (j.details) {
+            importStatusEl.innerHTML += '<br>State dir: ' + j.details.stateDir;
+            importStatusEl.innerHTML += '<br>Previous backup: ' + j.details.previousBackup;
+          }
+        } else {
+          importStatusEl.innerHTML = '<strong style="color:red">Import failed:</strong> ' + (j.error || 'Unknown error');
+        }
+        return refreshStatus();
+      }).catch(function (e) {
+        importStatusEl.innerHTML = '<strong style="color:red">Import error:</strong> ' + String(e);
+      }).finally(function () {
+        importBtn.disabled = false;
+      });
+    };
+  }
 
   refreshStatus();
 })();

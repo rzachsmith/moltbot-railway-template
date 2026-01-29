@@ -853,6 +853,12 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
         gatewayProc = null;
       }
 
+      // Helper: move directory (works across filesystems unlike rename)
+      const moveDir = (src, dest) => {
+        fs.cpSync(src, dest, { recursive: true });
+        fs.rmSync(src, { recursive: true, force: true });
+      };
+
       // Backup current state (optional safety measure)
       const backupTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
       const stateBackupPath = `${STATE_DIR}.bak-${backupTimestamp}`;
@@ -871,21 +877,21 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
       fs.mkdirSync(path.dirname(STATE_DIR), { recursive: true });
       fs.mkdirSync(path.dirname(WORKSPACE_DIR), { recursive: true });
 
-      // Move extracted files to their destinations
+      // Move extracted files to their destinations (use copy+delete for cross-device)
       const sourceStateDir = hasClawdbot
         ? path.join(extractDir, ".clawdbot")
         : path.join(extractDir, ".moltbot");
 
-      console.log(`[import] Moving ${sourceStateDir} to ${STATE_DIR}`);
-      fs.renameSync(sourceStateDir, STATE_DIR);
+      console.log(`[import] Copying ${sourceStateDir} to ${STATE_DIR}`);
+      moveDir(sourceStateDir, STATE_DIR);
 
       if (hasWorkspace) {
         const sourceWorkspaceDir = path.join(extractDir, "workspace");
-        console.log(`[import] Moving ${sourceWorkspaceDir} to ${WORKSPACE_DIR}`);
+        console.log(`[import] Copying ${sourceWorkspaceDir} to ${WORKSPACE_DIR}`);
 
         // If workspace is inside state dir, it was already moved
         if (WORKSPACE_DIR !== path.join(STATE_DIR, "workspace")) {
-          fs.renameSync(sourceWorkspaceDir, WORKSPACE_DIR);
+          moveDir(sourceWorkspaceDir, WORKSPACE_DIR);
         }
       }
 

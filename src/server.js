@@ -758,6 +758,8 @@ app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
         HOME: "/root",
         MOLTBOT_STATE_DIR: STATE_DIR,
         CLAWDBOT_STATE_DIR: STATE_DIR,
+        MOLTBOT_GATEWAY_TOKEN: GATEWAY_TOKEN,
+        CLAWDBOT_GATEWAY_TOKEN: GATEWAY_TOKEN,
       },
     });
     const output = (result.stdout || "") + (result.stderr || "");
@@ -769,6 +771,33 @@ app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
   } catch (err) {
     res.status(500).type("text/plain").send("Doctor failed: " + String(err));
   }
+});
+
+app.post("/setup/api/fix-permissions", requireSetupAuth, async (_req, res) => {
+  // Fix state directory permissions (doctor recommends chmod 700)
+  try {
+    if (!fs.existsSync(STATE_DIR)) {
+      return res.status(404).type("text/plain").send("State directory not found");
+    }
+    fs.chmodSync(STATE_DIR, 0o700);
+    res.type("text/plain").send(`Permissions fixed: chmod 700 ${STATE_DIR}`);
+  } catch (err) {
+    res.status(500).type("text/plain").send("Fix permissions failed: " + String(err));
+  }
+});
+
+// Show the current gateway token (for manually constructing dashboard URL)
+app.get("/setup/api/token", requireSetupAuth, (_req, res) => {
+  res.type("text/plain").send(GATEWAY_TOKEN);
+});
+
+// Redirect to the tokenized dashboard URL
+app.get("/setup/dashboard", requireSetupAuth, (req, res) => {
+  // The Control UI needs the gateway token in the URL query param
+  const host = req.get("host") || "localhost";
+  const protocol = req.get("x-forwarded-proto") || req.protocol || "https";
+  const dashboardUrl = `${protocol}://${host}/clawdbot?token=${encodeURIComponent(GATEWAY_TOKEN)}`;
+  res.redirect(dashboardUrl);
 });
 
 app.get("/setup/export", requireSetupAuth, async (_req, res) => {
@@ -933,6 +962,16 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
           moveDir(sourceWorkspaceDir, WORKSPACE_DIR);
         }
       }
+
+      // Update config to use the wrapper's gateway token (imported config has old token)
+      console.log("[import] Updating gateway token in config...");
+      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.auth.mode", "token"]));
+      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.auth.token", GATEWAY_TOKEN]));
+      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.bind", "loopback"]));
+      await runCmd(
+        MOLTBOT_NODE,
+        moltArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)])
+      );
 
       // Restart gateway with new config
       console.log("[import] Restarting gateway...");

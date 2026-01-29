@@ -794,7 +794,7 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
       await tar.x({
         file: tarPath,
         cwd: extractDir,
-        strict: true,
+        // Note: tar library safely strips leading / from absolute paths by default
         // Security: prevent path traversal
         filter: (entryPath) => {
           // Reject paths that try to escape

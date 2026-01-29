@@ -716,7 +716,7 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
 app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
   // Run moltbot doctor --fix to clean up invalid config keys
   try {
-    const result = spawnSync("moltbot", ["doctor", "--fix"], {
+    const result = childProcess.spawnSync("moltbot", ["doctor", "--fix"], {
       encoding: "utf8",
       timeout: 30000,
       env: { ...process.env, HOME: "/root" },

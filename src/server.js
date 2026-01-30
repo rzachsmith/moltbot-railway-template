@@ -9,11 +9,6 @@ import httpProxy from "http-proxy";
 import multer from "multer";
 import * as tar from "tar";
 
-// --- Telegram Tripwire Configuration ---
-// Rate-limit tripwire notifications: one per chat per 24 hours
-const tripwireNotifications = new Map(); // chatId -> lastNotificationTime
-const TRIPWIRE_RATE_LIMIT_MS = 24 * 60 * 60 * 1000; // 24 hours
-
 // Railway deployments sometimes inject PORT=3000 by default. We want the wrapper to
 // reliably listen on 8080 unless explicitly overridden.
 //
@@ -27,6 +22,12 @@ const PORT = Number.parseInt(
     "8080",
   10
 );
+
+// Configurable console log level (default: warn to reduce Railway log verbosity)
+// Valid levels: trace, debug, info, warn, error, fatal
+const VALID_LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal"];
+const rawConsoleLevel = process.env.OPENCLAW_CONSOLE_LEVEL?.toLowerCase() || "warn";
+const CONSOLE_LEVEL = VALID_LOG_LEVELS.includes(rawConsoleLevel) ? rawConsoleLevel : "warn";
 
 // Auto-detect state directory: prefer existing directories for backwards compat
 function autoDetectStateDir() {
@@ -243,44 +244,6 @@ async function restartGateway() {
     gatewayProc = null;
   }
   return ensureGatewayRunning();
-}
-
-// --- Telegram Tripwire ---
-// Send a DM notification to the owner when bot receives message from non-allowlisted group
-async function sendTripwireNotification(chat, config) {
-  const ownerUserId = config.agents?.defaults?.heartbeat?.to;
-  const botToken = config.channels?.telegram?.botToken;
-
-  if (!ownerUserId || !botToken) {
-    console.warn("[tripwire] Missing owner ID or bot token, skipping notification");
-    return;
-  }
-
-  const message = `⚠️ Tripwire Alert
-
-Received message from non-allowlisted group:
-• Title: ${chat.title || "(untitled)"}
-• Chat ID: ${chat.id}
-• Type: ${chat.type}
-
-To allowlist this group, add it to channels.telegram.groups in your config.`;
-
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: ownerUserId,
-        text: message,
-      }),
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      console.error(`[tripwire] Telegram API error: ${response.status} ${text}`);
-    }
-  } catch (err) {
-    console.error("[tripwire] Failed to send notification:", err.message);
-  }
 }
 
 function requireSetupAuth(req, res, next) {
@@ -684,9 +647,9 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         openclawArgs(["config", "set", "gateway.controlUi.basePath", "/openclaw"])
       );
 
-      // Set logging level to warn to reduce verbose output in Railway logs
-      // (suppresses [ws] slow-call info lines that can contain message content)
-      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "logging.consoleLevel", "warn"]));
+      // Set console logging level (configurable via OPENCLAW_CONSOLE_LEVEL, default: warn)
+      // This reduces Railway log verbosity while avoiding privacy leaks from verbose ws logs
+      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "logging.consoleLevel", CONSOLE_LEVEL]));
 
       const channelsHelp = await runCmd(OPENCLAW_NODE, openclawArgs(["channels", "add", "--help"]));
       const helpText = channelsHelp.output || "";
@@ -1091,8 +1054,8 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
         openclawArgs(["config", "set", "gateway.controlUi.basePath", "/openclaw"])
       );
 
-      // Set logging level to warn to reduce verbose output in Railway logs
-      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "logging.consoleLevel", "warn"]));
+      // Set console logging level (configurable via OPENCLAW_CONSOLE_LEVEL, default: warn)
+      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "logging.consoleLevel", CONSOLE_LEVEL]));
 
       // Restart gateway with new config
       console.log("[import] Restarting gateway...");
@@ -1184,60 +1147,6 @@ function requireControlUiAuth(req, res, next) {
 }
 
 app.use(requireControlUiAuth);
-
-// --- Telegram Tripwire Middleware ---
-// Intercept Telegram webhooks to detect messages from non-allowlisted groups
-app.use("/telegram", async (req, res, next) => {
-  if (req.method !== "POST") return next();
-
-  const update = req.body;
-  const message =
-    update?.message ||
-    update?.edited_message ||
-    update?.channel_post ||
-    update?.edited_channel_post;
-
-  if (!message?.chat) return next();
-
-  const chat = message.chat;
-  // Private chats (DMs) are fine - pass through
-  if (chat.type === "private") return next();
-
-  // It's a group/supergroup/channel message
-  const chatId = String(chat.id);
-
-  // Read config to check allowlist
-  let config;
-  try {
-    config = JSON.parse(fs.readFileSync(configPath(), "utf8"));
-  } catch {
-    return next(); // Can't read config, pass through
-  }
-
-  const telegramConfig = config.channels?.telegram;
-
-  // Only applies when using groupPolicy=allowlist
-  if (telegramConfig?.groupPolicy !== "allowlist") return next();
-
-  // Check if chat is in allowlist
-  const groups = telegramConfig?.groups || {};
-  if (groups[chatId]) return next(); // Allowlisted - pass through
-
-  // --- TRIPWIRE TRIGGERED ---
-  console.warn(`[tripwire] Non-allowlisted group detected: ${chat.title || "(untitled)"} (${chatId})`);
-
-  // Rate limit check
-  const lastNotification = tripwireNotifications.get(chatId) || 0;
-  const now = Date.now();
-
-  if (now - lastNotification > TRIPWIRE_RATE_LIMIT_MS) {
-    tripwireNotifications.set(chatId, now);
-    await sendTripwireNotification(chat, config);
-  }
-
-  // Return 200 to Telegram but do NOT forward to gateway (bot stays silent)
-  return res.status(200).json({ ok: true });
-});
 
 app.use(async (req, res) => {
   // If not configured, force users to /setup for any non-setup routes.

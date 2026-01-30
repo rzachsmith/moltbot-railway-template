@@ -12,17 +12,43 @@ import * as tar from "tar";
 // Railway deployments sometimes inject PORT=3000 by default. We want the wrapper to
 // reliably listen on 8080 unless explicitly overridden.
 //
-// Support both MOLTBOT_* and CLAWDBOT_* env vars for backwards compatibility.
-// MOLTBOT_* takes precedence if both are set.
+// Support OPENCLAW_*, MOLTBOT_*, and CLAWDBOT_* env vars for backwards compatibility.
+// OPENCLAW_* takes precedence, then MOLTBOT_*, then CLAWDBOT_*.
 const PORT = Number.parseInt(
-  process.env.MOLTBOT_PUBLIC_PORT ?? process.env.CLAWDBOT_PUBLIC_PORT ?? process.env.PORT ?? "8080",
+  process.env.OPENCLAW_PUBLIC_PORT ??
+    process.env.MOLTBOT_PUBLIC_PORT ??
+    process.env.CLAWDBOT_PUBLIC_PORT ??
+    process.env.PORT ??
+    "8080",
   10
 );
-const STATE_DIR =
-  process.env.MOLTBOT_STATE_DIR?.trim() ||
-  process.env.CLAWDBOT_STATE_DIR?.trim() ||
-  path.join(os.homedir(), ".clawdbot");
+
+// Auto-detect state directory: prefer existing directories for backwards compat
+function autoDetectStateDir() {
+  const openclawDir = "/data/.openclaw";
+  const clawdbotDir = "/data/.clawdbot";
+  const homeDir = path.join(os.homedir(), ".openclaw");
+
+  // If explicit env var is set, use it
+  const explicit =
+    process.env.OPENCLAW_STATE_DIR?.trim() ||
+    process.env.MOLTBOT_STATE_DIR?.trim() ||
+    process.env.CLAWDBOT_STATE_DIR?.trim();
+  if (explicit) return explicit;
+
+  // Auto-detect: prefer existing directories
+  if (fs.existsSync(openclawDir)) return openclawDir;
+  if (fs.existsSync(clawdbotDir)) return clawdbotDir;
+
+  // Default for new installs (Railway uses /data volume)
+  if (fs.existsSync("/data")) return openclawDir;
+
+  return homeDir;
+}
+
+const STATE_DIR = autoDetectStateDir();
 const WORKSPACE_DIR =
+  process.env.OPENCLAW_WORKSPACE_DIR?.trim() ||
   process.env.MOLTBOT_WORKSPACE_DIR?.trim() ||
   process.env.CLAWDBOT_WORKSPACE_DIR?.trim() ||
   path.join(STATE_DIR, "workspace");
@@ -30,11 +56,13 @@ const WORKSPACE_DIR =
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
-// Gateway admin token (protects Moltbot gateway + Control UI).
+// Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
 function resolveGatewayToken() {
   const envTok =
-    process.env.MOLTBOT_GATEWAY_TOKEN?.trim() || process.env.CLAWDBOT_GATEWAY_TOKEN?.trim();
+    process.env.OPENCLAW_GATEWAY_TOKEN?.trim() ||
+    process.env.MOLTBOT_GATEWAY_TOKEN?.trim() ||
+    process.env.CLAWDBOT_GATEWAY_TOKEN?.trim();
   if (envTok) return envTok;
 
   const tokenPath = path.join(STATE_DIR, "gateway.token");
@@ -56,7 +84,8 @@ function resolveGatewayToken() {
 }
 
 const GATEWAY_TOKEN = resolveGatewayToken();
-// Set both env vars for compatibility with moltbot (reads both)
+// Set all env vars for compatibility (OpenClaw reads OPENCLAW_*, legacy reads others)
+process.env.OPENCLAW_GATEWAY_TOKEN = GATEWAY_TOKEN;
 process.env.MOLTBOT_GATEWAY_TOKEN = GATEWAY_TOKEN;
 process.env.CLAWDBOT_GATEWAY_TOKEN = GATEWAY_TOKEN;
 
@@ -66,30 +95,41 @@ const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
 
 // Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
-// Moltbot uses dist/index.js (not dist/entry.js like clawdbot)
-const MOLTBOT_ENTRY =
-  process.env.MOLTBOT_ENTRY?.trim() || process.env.CLAWDBOT_ENTRY?.trim() || "/moltbot/dist/index.js";
-const MOLTBOT_NODE = process.env.MOLTBOT_NODE?.trim() || process.env.CLAWDBOT_NODE?.trim() || "node";
+// OpenClaw uses dist/index.js
+const OPENCLAW_ENTRY =
+  process.env.OPENCLAW_ENTRY?.trim() ||
+  process.env.MOLTBOT_ENTRY?.trim() ||
+  process.env.CLAWDBOT_ENTRY?.trim() ||
+  "/openclaw/dist/index.js";
+const OPENCLAW_NODE =
+  process.env.OPENCLAW_NODE?.trim() ||
+  process.env.OPENCLAW_NODE?.trim() ||
+  process.env.CLAWDBOT_NODE?.trim() ||
+  "node";
 
-function moltArgs(args) {
-  return [MOLTBOT_ENTRY, ...args];
+function openclawArgs(args) {
+  return [OPENCLAW_ENTRY, ...args];
 }
 
-// Moltbot supports both moltbot.json and clawdbot.json - check both
+// OpenClaw supports openclaw.json, moltbot.json, and clawdbot.json - check all three
 function configPath() {
   const explicit =
-    process.env.MOLTBOT_CONFIG_PATH?.trim() || process.env.CLAWDBOT_CONFIG_PATH?.trim();
+    process.env.OPENCLAW_CONFIG_PATH?.trim() ||
+    process.env.MOLTBOT_CONFIG_PATH?.trim() ||
+    process.env.CLAWDBOT_CONFIG_PATH?.trim();
   if (explicit) return explicit;
 
-  // Prefer moltbot.json if it exists, otherwise fall back to clawdbot.json
+  // Prefer openclaw.json, then moltbot.json, then clawdbot.json
+  const openclawConfig = path.join(STATE_DIR, "openclaw.json");
   const moltbotConfig = path.join(STATE_DIR, "moltbot.json");
   const clawdbotConfig = path.join(STATE_DIR, "clawdbot.json");
 
+  if (fs.existsSync(openclawConfig)) return openclawConfig;
   if (fs.existsSync(moltbotConfig)) return moltbotConfig;
   if (fs.existsSync(clawdbotConfig)) return clawdbotConfig;
 
-  // Default to clawdbot.json for backwards compatibility with restored backups
-  return clawdbotConfig;
+  // Default to openclaw.json for new installs
+  return openclawConfig;
 }
 
 function isConfigured() {
@@ -112,8 +152,8 @@ async function waitForGatewayReady(opts = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      // Moltbot gateway responds at /clawdbot for backwards compatibility
-      const res = await fetch(`${GATEWAY_TARGET}/clawdbot`, { method: "GET" });
+      // OpenClaw gateway responds at /openclaw (configured via controlUi.basePath)
+      const res = await fetch(`${GATEWAY_TARGET}/openclaw`, { method: "GET" });
       // Any HTTP response means the port is open.
       if (res) return true;
     } catch {
@@ -144,12 +184,14 @@ async function startGateway() {
     GATEWAY_TOKEN,
   ];
 
-  gatewayProc = childProcess.spawn(MOLTBOT_NODE, moltArgs(args), {
+  gatewayProc = childProcess.spawn(OPENCLAW_NODE, openclawArgs(args), {
     stdio: "inherit",
     env: {
       ...process.env,
+      OPENCLAW_STATE_DIR: STATE_DIR,
       MOLTBOT_STATE_DIR: STATE_DIR,
       CLAWDBOT_STATE_DIR: STATE_DIR,
+      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
       MOLTBOT_WORKSPACE_DIR: WORKSPACE_DIR,
       CLAWDBOT_WORKSPACE_DIR: WORKSPACE_DIR,
     },
@@ -209,14 +251,14 @@ function requireSetupAuth(req, res, next) {
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
   if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="Moltbot Setup"');
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Auth required");
   }
   const decoded = Buffer.from(encoded, "base64").toString("utf8");
   const idx = decoded.indexOf(":");
   const password = idx >= 0 ? decoded.slice(idx + 1) : "";
   if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="Moltbot Setup"');
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Invalid password");
   }
   return next();
@@ -275,7 +317,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Moltbot Setup</title>
+  <title>OpenClaw Setup</title>
   <style>
     body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 2rem; max-width: 900px; }
     .card { border: 1px solid #ddd; border-radius: 12px; padding: 1.25rem; margin: 1rem 0; }
@@ -287,14 +329,14 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
   </style>
 </head>
 <body>
-  <h1>Moltbot Setup</h1>
-  <p class="muted">This wizard configures Moltbot by running the same onboarding command it uses in the terminal, but from the browser.</p>
+  <h1>OpenClaw Setup</h1>
+  <p class="muted">This wizard configures OpenClaw by running the same onboarding command it uses in the terminal, but from the browser.</p>
 
   <div class="card">
     <h2>Status</h2>
     <div id="status">Loading...</div>
     <div style="margin-top: 0.75rem">
-      <a href="/clawdbot" target="_blank">Open Moltbot UI</a>
+      <a href="/openclaw" target="_blank">Open Control UI</a>
       &nbsp;|&nbsp;
       <a href="/setup/export" target="_blank">Download backup (.tar.gz)</a>
     </div>
@@ -322,7 +364,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
 
   <div class="card">
     <h2>2) Optional: Channels</h2>
-    <p class="muted">You can also add channels later inside Moltbot, but this helps you get messaging working immediately.</p>
+    <p class="muted">You can also add channels later inside OpenClaw, but this helps you get messaging working immediately.</p>
 
     <label>Telegram bot token (optional)</label>
     <input id="telegramToken" type="password" placeholder="123456:ABC..." />
@@ -350,7 +392,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     <button id="pairingApprove" style="background:#1f2937; margin-left:0.5rem">Approve pairing</button>
     <button id="reset" style="background:#444; margin-left:0.5rem">Reset setup</button>
     <pre id="log" style="white-space:pre-wrap"></pre>
-    <p class="muted">Reset deletes the Moltbot config file so you can rerun onboarding. Pairing approval lets you grant DM access when dmPolicy=pairing.</p>
+    <p class="muted">Reset deletes the OpenClaw config file so you can rerun onboarding. Pairing approval lets you grant DM access when dmPolicy=pairing.</p>
   </div>
 
   <div class="card">
@@ -367,10 +409,10 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
 });
 
 app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
-  const version = await runCmd(MOLTBOT_NODE, moltArgs(["--version"]));
-  const channelsHelp = await runCmd(MOLTBOT_NODE, moltArgs(["channels", "add", "--help"]));
+  const version = await runCmd(OPENCLAW_NODE, openclawArgs(["--version"]));
+  const channelsHelp = await runCmd(OPENCLAW_NODE, openclawArgs(["channels", "add", "--help"]));
 
-  // We reuse Moltbot's own auth-choice grouping logic indirectly by hardcoding the same group defs.
+  // We reuse OpenClaw's own auth-choice grouping logic indirectly by hardcoding the same group defs.
   // This is intentionally minimal; later we can parse the CLI help output to stay perfectly in sync.
   const authGroups = [
     {
@@ -471,7 +513,7 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   res.json({
     configured: isConfigured(),
     gatewayTarget: GATEWAY_TARGET,
-    moltbotVersion: version.output.trim(),
+    openclawVersion: version.output.trim(),
     channelsAddHelp: channelsHelp.output,
     authGroups,
   });
@@ -539,8 +581,10 @@ function runCmd(cmd, args, opts = {}) {
       ...opts,
       env: {
         ...process.env,
+        OPENCLAW_STATE_DIR: STATE_DIR,
         MOLTBOT_STATE_DIR: STATE_DIR,
         CLAWDBOT_STATE_DIR: STATE_DIR,
+        OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
         MOLTBOT_WORKSPACE_DIR: WORKSPACE_DIR,
         CLAWDBOT_WORKSPACE_DIR: WORKSPACE_DIR,
       },
@@ -574,7 +618,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
     const payload = req.body || {};
     const onboardArgs = buildOnboardArgs(payload);
-    const onboard = await runCmd(MOLTBOT_NODE, moltArgs(onboardArgs));
+    const onboard = await runCmd(OPENCLAW_NODE, openclawArgs(onboardArgs));
 
     let extra = "";
 
@@ -584,15 +628,20 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     if (ok) {
       // Ensure gateway token is written into config so the browser UI can authenticate reliably.
       // (We also enforce loopback bind since the wrapper proxies externally.)
-      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.auth.mode", "token"]));
-      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.auth.token", GATEWAY_TOKEN]));
-      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.bind", "loopback"]));
+      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "gateway.auth.mode", "token"]));
+      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "gateway.auth.token", GATEWAY_TOKEN]));
+      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "gateway.bind", "loopback"]));
       await runCmd(
-        MOLTBOT_NODE,
-        moltArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)])
+        OPENCLAW_NODE,
+        openclawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)])
+      );
+      // Set Control UI basePath to /openclaw (wrapper routes to this path)
+      await runCmd(
+        OPENCLAW_NODE,
+        openclawArgs(["config", "set", "gateway.controlUi.basePath", "/openclaw"])
       );
 
-      const channelsHelp = await runCmd(MOLTBOT_NODE, moltArgs(["channels", "add", "--help"]));
+      const channelsHelp = await runCmd(OPENCLAW_NODE, openclawArgs(["channels", "add", "--help"]));
       const helpText = channelsHelp.output || "";
 
       const supports = (name) => helpText.includes(name);
@@ -600,7 +649,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       if (payload.telegramToken?.trim()) {
         if (!supports("telegram")) {
           extra +=
-            "\n[telegram] skipped (this moltbot build does not list telegram in `channels add --help`)\n";
+            "\n[telegram] skipped (this openclaw build does not list telegram in `channels add --help`)\n";
         } else {
           // Avoid `channels add` here (it has proven flaky across builds); write config directly.
           const token = payload.telegramToken.trim();
@@ -612,10 +661,10 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
             streamMode: "partial",
           };
           const set = await runCmd(
-            MOLTBOT_NODE,
-            moltArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(cfgObj)])
+            OPENCLAW_NODE,
+            openclawArgs(["config", "set", "--json", "channels.telegram", JSON.stringify(cfgObj)])
           );
-          const get = await runCmd(MOLTBOT_NODE, moltArgs(["config", "get", "channels.telegram"]));
+          const get = await runCmd(OPENCLAW_NODE, openclawArgs(["config", "get", "channels.telegram"]));
           extra += `\n[telegram config] exit=${set.code} (output ${set.output.length} chars)\n${set.output || "(no output)"}`;
           extra += `\n[telegram verify] exit=${get.code} (output ${get.output.length} chars)\n${get.output || "(no output)"}`;
         }
@@ -624,7 +673,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       if (payload.discordToken?.trim()) {
         if (!supports("discord")) {
           extra +=
-            "\n[discord] skipped (this moltbot build does not list discord in `channels add --help`)\n";
+            "\n[discord] skipped (this openclaw build does not list discord in `channels add --help`)\n";
         } else {
           const token = payload.discordToken.trim();
           const cfgObj = {
@@ -636,10 +685,10 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
             },
           };
           const set = await runCmd(
-            MOLTBOT_NODE,
-            moltArgs(["config", "set", "--json", "channels.discord", JSON.stringify(cfgObj)])
+            OPENCLAW_NODE,
+            openclawArgs(["config", "set", "--json", "channels.discord", JSON.stringify(cfgObj)])
           );
-          const get = await runCmd(MOLTBOT_NODE, moltArgs(["config", "get", "channels.discord"]));
+          const get = await runCmd(OPENCLAW_NODE, openclawArgs(["config", "get", "channels.discord"]));
           extra += `\n[discord config] exit=${set.code} (output ${set.output.length} chars)\n${set.output || "(no output)"}`;
           extra += `\n[discord verify] exit=${get.code} (output ${get.output.length} chars)\n${get.output || "(no output)"}`;
         }
@@ -648,7 +697,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       if (payload.slackBotToken?.trim() || payload.slackAppToken?.trim()) {
         if (!supports("slack")) {
           extra +=
-            "\n[slack] skipped (this moltbot build does not list slack in `channels add --help`)\n";
+            "\n[slack] skipped (this openclaw build does not list slack in `channels add --help`)\n";
         } else {
           const cfgObj = {
             enabled: true,
@@ -656,10 +705,10 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
             appToken: payload.slackAppToken?.trim() || undefined,
           };
           const set = await runCmd(
-            MOLTBOT_NODE,
-            moltArgs(["config", "set", "--json", "channels.slack", JSON.stringify(cfgObj)])
+            OPENCLAW_NODE,
+            openclawArgs(["config", "set", "--json", "channels.slack", JSON.stringify(cfgObj)])
           );
-          const get = await runCmd(MOLTBOT_NODE, moltArgs(["config", "get", "channels.slack"]));
+          const get = await runCmd(OPENCLAW_NODE, openclawArgs(["config", "get", "channels.slack"]));
           extra += `\n[slack config] exit=${set.code} (output ${set.output.length} chars)\n${set.output || "(no output)"}`;
           extra += `\n[slack verify] exit=${get.code} (output ${get.output.length} chars)\n${get.output || "(no output)"}`;
         }
@@ -680,8 +729,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 });
 
 app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
-  const v = await runCmd(MOLTBOT_NODE, moltArgs(["--version"]));
-  const help = await runCmd(MOLTBOT_NODE, moltArgs(["channels", "add", "--help"]));
+  const v = await runCmd(OPENCLAW_NODE, openclawArgs(["--version"]));
+  const help = await runCmd(OPENCLAW_NODE, openclawArgs(["channels", "add", "--help"]));
   res.json({
     wrapper: {
       node: process.version,
@@ -690,14 +739,16 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       workspaceDir: WORKSPACE_DIR,
       configPath: configPath(),
       gatewayTokenFromEnv: Boolean(
-        process.env.MOLTBOT_GATEWAY_TOKEN?.trim() || process.env.CLAWDBOT_GATEWAY_TOKEN?.trim()
+        process.env.OPENCLAW_GATEWAY_TOKEN?.trim() ||
+        process.env.MOLTBOT_GATEWAY_TOKEN?.trim() ||
+        process.env.CLAWDBOT_GATEWAY_TOKEN?.trim()
       ),
       gatewayTokenPersisted: fs.existsSync(path.join(STATE_DIR, "gateway.token")),
       railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
     },
-    moltbot: {
-      entry: MOLTBOT_ENTRY,
-      node: MOLTBOT_NODE,
+    openclaw: {
+      entry: OPENCLAW_ENTRY,
+      node: OPENCLAW_NODE,
       version: v.output.trim(),
       channelsAddHelpIncludesTelegram: help.output.includes("telegram"),
     },
@@ -709,7 +760,7 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   if (!channel || !code) {
     return res.status(400).json({ ok: false, error: "Missing channel or code" });
   }
-  const r = await runCmd(MOLTBOT_NODE, moltArgs(["pairing", "approve", String(channel), String(code)]));
+  const r = await runCmd(OPENCLAW_NODE, openclawArgs(["pairing", "approve", String(channel), String(code)]));
   return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: r.output });
 });
 
@@ -759,9 +810,9 @@ app.post("/setup/api/fix-config", requireSetupAuth, async (_req, res) => {
 });
 
 app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
-  // Run moltbot doctor --fix to clean up invalid config keys
+  // Run openclaw doctor --fix to clean up invalid config keys
   try {
-    const result = childProcess.spawnSync("moltbot", ["doctor", "--fix"], {
+    const result = childProcess.spawnSync("openclaw", ["doctor", "--fix"], {
       encoding: "utf8",
       timeout: 30000,
       env: {
@@ -807,7 +858,7 @@ app.get("/setup/dashboard", requireSetupAuth, (req, res) => {
   // The Control UI needs the gateway token in the URL query param
   const host = req.get("host") || "localhost";
   const protocol = req.get("x-forwarded-proto") || req.protocol || "https";
-  const dashboardUrl = `${protocol}://${host}/clawdbot?token=${encodeURIComponent(GATEWAY_TOKEN)}`;
+  const dashboardUrl = `${protocol}://${host}/openclaw?token=${encodeURIComponent(GATEWAY_TOKEN)}`;
   res.redirect(dashboardUrl);
 });
 
@@ -818,11 +869,11 @@ app.get("/setup/export", requireSetupAuth, async (_req, res) => {
   res.setHeader("content-type", "application/gzip");
   res.setHeader(
     "content-disposition",
-    `attachment; filename="moltbot-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz"`
+    `attachment; filename="openclaw-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.tar.gz"`
   );
 
   // Prefer exporting from a common /data root so archives are easy to inspect and restore.
-  // This preserves dotfiles like /data/.clawdbot/clawdbot.json.
+  // This preserves dotfiles like /data/.openclaw/openclaw.json (or legacy .clawdbot).
   const stateAbs = path.resolve(STATE_DIR);
   const workspaceAbs = path.resolve(WORKSPACE_DIR);
 
@@ -877,7 +928,7 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
     );
 
     // Create staging directory
-    const stagingDir = path.join(os.tmpdir(), `moltbot-import-${crypto.randomBytes(8).toString("hex")}`);
+    const stagingDir = path.join(os.tmpdir(), `openclaw-import-${crypto.randomBytes(8).toString("hex")}`);
     fs.mkdirSync(stagingDir, { recursive: true });
 
     try {
@@ -904,19 +955,20 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
         },
       });
 
-      // Validate extracted structure - should have .clawdbot or .moltbot directory
+      // Validate extracted structure - should have .openclaw, .clawdbot, or .moltbot directory
       const extractedContents = fs.readdirSync(extractDir);
       console.log(`[import] Extracted contents: ${extractedContents.join(", ")}`);
 
+      const hasOpenclaw = extractedContents.includes(".openclaw");
       const hasClawdbot = extractedContents.includes(".clawdbot");
       const hasMoltbot = extractedContents.includes(".moltbot");
       const hasWorkspace = extractedContents.includes("workspace");
 
-      if (!hasClawdbot && !hasMoltbot) {
+      if (!hasOpenclaw && !hasClawdbot && !hasMoltbot) {
         return res.status(400).json({
           ok: false,
           error:
-            "Invalid backup: missing .clawdbot or .moltbot directory. Archive should contain state directory.",
+            "Invalid backup: missing .openclaw, .clawdbot, or .moltbot directory. Archive should contain state directory.",
         });
       }
 
@@ -957,9 +1009,12 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
       fs.mkdirSync(path.dirname(WORKSPACE_DIR), { recursive: true });
 
       // Move extracted files to their destinations (use copy+delete for cross-device)
-      const sourceStateDir = hasClawdbot
-        ? path.join(extractDir, ".clawdbot")
-        : path.join(extractDir, ".moltbot");
+      // Prefer .openclaw, then .clawdbot, then .moltbot
+      const sourceStateDir = hasOpenclaw
+        ? path.join(extractDir, ".openclaw")
+        : hasClawdbot
+          ? path.join(extractDir, ".clawdbot")
+          : path.join(extractDir, ".moltbot");
 
       console.log(`[import] Copying ${sourceStateDir} to ${STATE_DIR}`);
       moveDir(sourceStateDir, STATE_DIR);
@@ -976,12 +1031,17 @@ app.post("/setup/import", requireSetupAuth, upload.single("backup"), async (req,
 
       // Update config to use the wrapper's gateway token (imported config has old token)
       console.log("[import] Updating gateway token in config...");
-      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.auth.mode", "token"]));
-      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.auth.token", GATEWAY_TOKEN]));
-      await runCmd(MOLTBOT_NODE, moltArgs(["config", "set", "gateway.bind", "loopback"]));
+      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "gateway.auth.mode", "token"]));
+      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "gateway.auth.token", GATEWAY_TOKEN]));
+      await runCmd(OPENCLAW_NODE, openclawArgs(["config", "set", "gateway.bind", "loopback"]));
       await runCmd(
-        MOLTBOT_NODE,
-        moltArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)])
+        OPENCLAW_NODE,
+        openclawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)])
+      );
+      // Set Control UI basePath to /openclaw (wrapper routes to this path)
+      await runCmd(
+        OPENCLAW_NODE,
+        openclawArgs(["config", "set", "gateway.controlUi.basePath", "/openclaw"])
       );
 
       // Restart gateway with new config
@@ -1045,7 +1105,7 @@ function requireControlUiAuth(req, res, next) {
   }
 
   // Only protect Control UI routes
-  if (!req.path.startsWith("/clawdbot")) {
+  if (!req.path.startsWith("/openclaw")) {
     return next();
   }
 
@@ -1060,14 +1120,14 @@ function requireControlUiAuth(req, res, next) {
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
   if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="Moltbot Control UI"');
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Control UI"');
     return res.status(401).send("Auth required");
   }
   const decoded = Buffer.from(encoded, "base64").toString("utf8");
   const idx = decoded.indexOf(":");
   const password = idx >= 0 ? decoded.slice(idx + 1) : "";
   if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="Moltbot Control UI"');
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Control UI"');
     return res.status(401).send("Invalid password");
   }
   return next();
@@ -1114,7 +1174,7 @@ server.on("upgrade", async (req, socket, head) => {
   // (The gateway token is a second layer of auth, but this ensures only
   // users with SETUP_PASSWORD can even attempt to connect)
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const isControlUi = url.pathname.startsWith("/clawdbot");
+  const isControlUi = url.pathname.startsWith("/openclaw");
 
   if (isControlUi && SETUP_PASSWORD) {
     const header = req.headers.authorization || "";

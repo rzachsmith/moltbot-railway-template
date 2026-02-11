@@ -220,15 +220,39 @@ async function startGateway() {
   });
 }
 
+async function runDoctorBestEffort() {
+  // Avoid spamming `openclaw doctor` in a crash loop.
+  const now = Date.now();
+  if (lastDoctorAt && now - lastDoctorAt < 5 * 60 * 1000) return;
+  lastDoctorAt = now;
+
+  try {
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["doctor"]));
+    const out = redactSecrets(r.output || "");
+    lastDoctorOutput = out.length > 50_000 ? out.slice(0, 50_000) + "\n... (truncated)\n" : out;
+  } catch (err) {
+    lastDoctorOutput = `doctor failed: ${String(err)}`;
+  }
+}
+
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayProc) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
-      await startGateway();
-      const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
-      if (!ready) {
-        throw new Error("Gateway did not become ready in time");
+      try {
+        lastGatewayError = null;
+        await startGateway();
+        const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
+        if (!ready) {
+          throw new Error("Gateway did not become ready in time");
+        }
+      } catch (err) {
+        const msg = `[gateway] start failure: ${String(err)}`;
+        lastGatewayError = msg;
+        // Collect extra diagnostics to help users file issues.
+        await runDoctorBestEffort();
+        throw err;
       }
     })().finally(() => {
       gatewayStarting = null;
@@ -250,6 +274,33 @@ async function restartGateway() {
     gatewayProc = null;
   }
   return ensureGatewayRunning();
+}
+
+function redactSecrets(text) {
+  if (!text) return text;
+  // Very small best-effort redaction. (Config paths/values may still contain secrets.)
+  return String(text)
+    .replace(/(sk-[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
+    .replace(/(gho_[A-Za-z0-9_]{10,})/g, "[REDACTED]")
+    .replace(/(xox[baprs]-[A-Za-z0-9-]{10,})/g, "[REDACTED]")
+    // Telegram bot tokens look like: 123456:ABCDEF...
+    .replace(/(\d{5,}:[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
+    .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
+}
+
+async function runDoctorBestEffort() {
+  // Avoid spamming `openclaw doctor` in a crash loop.
+  const now = Date.now();
+  if (lastDoctorAt && now - lastDoctorAt < 5 * 60 * 1000) return;
+  lastDoctorAt = now;
+
+  try {
+    const r = await runCmd(OPENCLAW_NODE, openclawArgs(["doctor"]));
+    const out = redactSecrets(r.output || "");
+    lastDoctorOutput = out.length > 50_000 ? out.slice(0, 50_000) + "\n... (truncated)\n" : out;
+  } catch (err) {
+    lastDoctorOutput = `doctor failed: ${String(err)}`;
+  }
 }
 
 function requireSetupAuth(req, res, next) {
@@ -844,6 +895,10 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
         process.env.CLAWDBOT_GATEWAY_TOKEN?.trim()
       ),
       gatewayTokenPersisted: fs.existsSync(path.join(STATE_DIR, "gateway.token")),
+      lastGatewayError,
+      lastGatewayExit,
+      lastDoctorAt,
+      lastDoctorOutput,
       railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
     },
     openclaw: {

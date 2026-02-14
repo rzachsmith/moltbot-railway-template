@@ -602,9 +602,10 @@ function runCmd(cmd, args, opts = {}) {
     proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
     proc.stderr?.on("data", (d) => (out += d.toString("utf8")));
 
+    let killTimer;
     const timer = setTimeout(() => {
       try { proc.kill("SIGTERM"); } catch {}
-      setTimeout(() => {
+      killTimer = setTimeout(() => {
         try { proc.kill("SIGKILL"); } catch {}
       }, 2_000);
       out += `\n[timeout] Command exceeded ${timeoutMs}ms and was terminated.\n`;
@@ -613,12 +614,14 @@ function runCmd(cmd, args, opts = {}) {
 
     proc.on("error", (err) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       out += `\n[spawn error] ${String(err)}\n`;
       resolve({ code: 127, output: out });
     });
 
     proc.on("close", (code) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       resolve({ code: code ?? 0, output: out });
     });
   });
@@ -626,6 +629,11 @@ function runCmd(cmd, args, opts = {}) {
 
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
+    const safeWrite = (msg) => {
+      try {
+        if (!res.writableEnded) res.write(String(msg) + "\n");
+      } catch {}
+    };
     if (isConfigured()) {
       await ensureGatewayRunning();
       return res.json({
@@ -639,6 +647,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
     const payload = req.body || {};
     const onboardArgs = buildOnboardArgs(payload);
+
+    safeWrite("[setup] running openclaw onboard...");
     const onboard = await runCmd(OPENCLAW_NODE, openclawArgs(onboardArgs));
 
     let extra = "";
@@ -1122,8 +1132,16 @@ const proxy = httpProxy.createProxyServer({
   xfwd: true,
 });
 
-proxy.on("error", (err, _req, _res) => {
+proxy.on("error", (err, _req, res) => {
   console.error("[proxy]", err);
+  try {
+    if (res && typeof res.writeHead === "function" && !res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("Gateway unavailable\n");
+    }
+  } catch {
+    // ignore
+  }
 });
 
 // Routes that must remain public (webhooks from external services)
@@ -1254,5 +1272,13 @@ process.on("SIGTERM", () => {
   } catch {
     // ignore
   }
-  process.exit(0);
+
+  // Stop accepting new connections; allow in-flight requests to complete briefly.
+  try {
+    server.close(() => process.exit(0));
+  } catch {
+    process.exit(0);
+  }
+
+  setTimeout(() => process.exit(0), 5_000).unref?.();
 });

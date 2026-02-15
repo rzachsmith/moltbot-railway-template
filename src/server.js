@@ -1337,6 +1337,15 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
   console.log(`[wrapper] workspace dir: ${WORKSPACE_DIR}`);
+
+  // Harden state dir for OpenClaw and avoid missing credentials dir on fresh volumes.
+  try {
+    fs.mkdirSync(path.join(STATE_DIR, "credentials"), { recursive: true });
+  } catch {}
+  try {
+    fs.chmodSync(STATE_DIR, 0o700);
+  } catch {}
+
   console.log(`[wrapper] gateway token: ${GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
   if (!SETUP_PASSWORD) {
